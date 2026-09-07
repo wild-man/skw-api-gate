@@ -1,4 +1,3 @@
-use skw_lib_shared::skw_get_consumer_name;
 #[allow(unused_imports)]
 use skw_lib_shared::{
     APP, AppError,
@@ -10,6 +9,7 @@ use skw_lib_shared::{
         log::{error, info, warn},
         strum::EnumString,
     },
+    skw_get_consumer_name,
 };
 use std::{
     collections::HashMap,
