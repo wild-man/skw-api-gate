@@ -62,7 +62,7 @@ impl TryFrom<ReceivedMessage> for IggyReceivedMessage {
 
         Ok(IggyReceivedMessage {
             payload: m.message.payload.to_vec(),
-            signature: signature,
+            signature,
             service_error,
         })
     }
@@ -104,15 +104,15 @@ impl GateState {
                 info!("starting back receiver thread {}", consumer_name1);
                 while let Some(message) = iggy_consumer.next().await {
                     match message {
-                        Ok(received) => {
-                            if let Ok(m) = received.try_into() {
+                        Ok(received) => match received.try_into() {
+                            Ok(m) => {
                                 if let Err(e) = consumer_tx.send(m) {
-                                    error!("tokio::sync::broadcast::channel error: {}", e.to_string())
-                                };
+                                    error!("tokio::sync::broadcast::channel error: {}", e)
+                                }
                             }
-                        }
-
-                        Err(error) => error!("Error while receiving message: {error}"),
+                            Err(e) => error!("error converting back message: {}", e),
+                        },
+                        Err(e) => error!("Error while receiving message: {}", e),
                     }
                 }
             }
@@ -125,9 +125,7 @@ impl GateState {
 
             let mut rx = consumer_tx.subscribe();
             loop {
-                match rx.recv().await {
-                    _ => continue,
-                }
+                let _ = rx.recv().await;
             }
         });
 

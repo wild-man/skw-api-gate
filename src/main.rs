@@ -157,7 +157,7 @@ async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &IggyClient) -> 
                     .custom_name
                     .unwrap_or(format!("{}-{}", service, VERSION));
 
-                skw_is_valid_name(&topic).expect(&format!("invalid topic name: {}", topic));
+                skw_is_valid_name(&topic).unwrap_or_else(|| panic!("invalid topic name: {}", topic));
 
                 match iggy_client
                     .create_topic(
@@ -251,7 +251,7 @@ async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: 
             {
                 Ok(_) => cnt_signature.to_string(),
                 Err(e) => {
-                    error!("{:?}", &e);
+                    error!("{:?}", e);
                     return e;
                 }
             }
@@ -336,19 +336,19 @@ async fn send_message_to_service(
         })?,
     );
 
-    let bytes = Bytes::copy_from_slice(&body); //@todo try to remove copy_from_slice
+    let bytes = Bytes::copy_from_slice(body); //@todo try to remove copy_from_slice
     let message = IggyMessage::builder()
         .payload(bytes)
         .user_headers(headers)
         .build();
 
     if let Err(e) = message {
-        error!("Iggy build message error: {}", e.to_string());
+        error!("Iggy build message error: {}", e);
         return Err(HttpResponse::InternalServerError().into());
     }
 
     if let Err(e) = producer.send_one(message.unwrap()).await {
-        error!("sending to iggy error: {}", e.to_string());
+        error!("sending to iggy error: {}", e);
         return Err(HttpResponse::InternalServerError().into());
     }
 
@@ -373,12 +373,12 @@ async fn await_service_response(mut rx: Receiver<IggyReceivedMessage>, signature
 
     match tokio::time::timeout(BACK_MESSAGE_TIMEOUT, wait_for_match).await {
         Ok(Ok(m)) => match m.service_error {
-            None => HttpResponse::Ok().body(m.payload).into(),
+            None => HttpResponse::Ok().body(m.payload),
             // add body from service response to transfer original service response to user
-            Some(s) => service_error_to_http_response(s).body(m.payload).into(),
+            Some(s) => service_error_to_http_response(s).body(m.payload),
         },
         Ok(Err(e)) => {
-            error!("back channel error: {}", e.to_string());
+            error!("back channel error: {}", e);
             HttpResponse::InternalServerError().into()
         }
         Err(_) => {
