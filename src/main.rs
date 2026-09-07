@@ -202,6 +202,8 @@ async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &IggyClient) -> 
 }
 
 async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: NtexBytes) -> HttpResponse {
+    let ts_gate_received = Utc::now();
+
     let method = req.method();
     let slug1 = req.path().split("/").nth(1);
 
@@ -216,7 +218,7 @@ async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: 
         }
     };
 
-    let req_signature = match *method {
+    let (ts_client, req_signature, ts_gate_published) = match *method {
         Method::CONNECT | Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE => {
             // no headers check is needed
 
@@ -249,7 +251,7 @@ async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: 
             )
             .await
             {
-                Ok(_) => cnt_signature.to_string(),
+                Ok(ts_gate_published) => (None, cnt_signature.to_string(), ts_gate_published),
                 Err(e) => {
                     error!("{:?}", e);
                     return e;
@@ -261,10 +263,10 @@ async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: 
                 return HttpResponse::BadRequest().into();
             };
 
-            match serde_json::from_str::<JsonRpcGateHttpRequest>(str_body) {
+            let ts_client = match serde_json::from_str::<JsonRpcGateHttpRequest>(str_body) {
                 Err(_) => return HttpResponse::BadRequest().into(),
-                Ok(_r) => {}
-            }
+                Ok(r) => r.ts,
+            };
 
             let (api_key, req_signature) = match auth::check_auth_key_and_request_signature(&state.auth_service_url, &req, str_body).await {
                 Err(e) => return app_error_to_http_response(&req, e),
@@ -281,7 +283,7 @@ async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: 
             )
             .await
             {
-                Ok(_) => req_signature,
+                Ok(ts_gate_published) => (Some(ts_client), req_signature, ts_gate_published),
                 Err(e) => return e,
             }
         }
@@ -289,7 +291,16 @@ async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: 
     };
 
     let rx = state.back_sender.subscribe();
-    await_service_response(rx, &req_signature).await
+    await_service_response(
+        rx,
+        &req_signature,
+        method,
+        req.path(),
+        ts_client,
+        ts_gate_received,
+        ts_gate_published,
+    )
+    .await
 }
 
 async fn send_message_to_service(
@@ -299,7 +310,7 @@ async fn send_message_to_service(
     method: &Method,
     path: &str,
     body: &[u8],
-) -> Result<(), HttpResponse> {
+) -> Result<DateTime<Utc>, HttpResponse> {
     let mut headers = BTreeMap::new();
 
     headers.insert(
@@ -352,10 +363,19 @@ async fn send_message_to_service(
         return Err(HttpResponse::InternalServerError().into());
     }
 
-    Ok(())
+    Ok(Utc::now())
 }
 
-async fn await_service_response(mut rx: Receiver<IggyReceivedMessage>, signature: &str) -> HttpResponse {
+#[allow(clippy::too_many_arguments)]
+async fn await_service_response(
+    mut rx: Receiver<IggyReceivedMessage>,
+    signature: &str,
+    method: &Method,
+    path: &str,
+    ts_client: Option<DateTime<Utc>>,
+    ts_gate_received: DateTime<Utc>,
+    ts_gate_published: DateTime<Utc>,
+) -> HttpResponse {
     let wait_for_match = async move {
         loop {
             match rx.recv().await {
@@ -372,11 +392,26 @@ async fn await_service_response(mut rx: Receiver<IggyReceivedMessage>, signature
     };
 
     match tokio::time::timeout(BACK_MESSAGE_TIMEOUT, wait_for_match).await {
-        Ok(Ok(m)) => match m.service_error {
-            None => HttpResponse::Ok().body(m.payload),
-            // add body from service response to transfer original service response to user
-            Some(s) => service_error_to_http_response(s).body(m.payload),
-        },
+        Ok(Ok(m)) => {
+            log_request_timing(
+                signature,
+                method,
+                path,
+                ts_client,
+                ts_gate_received,
+                ts_gate_published,
+                m.ts_service_received,
+                m.ts_service_sent,
+                m.ts_gate_back_received,
+                Utc::now(),
+            );
+
+            match m.service_error {
+                None => HttpResponse::Ok().body(m.payload),
+                // add body from service response to transfer original service response to user
+                Some(s) => service_error_to_http_response(s).body(m.payload),
+            }
+        }
         Ok(Err(e)) => {
             error!("back channel error: {}", e);
             HttpResponse::InternalServerError().into()
@@ -391,6 +426,37 @@ async fn await_service_response(mut rx: Receiver<IggyReceivedMessage>, signature
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn log_request_timing(
+    signature: &str,
+    method: &Method,
+    path: &str,
+    ts_client: Option<DateTime<Utc>>,
+    ts_gate_received: DateTime<Utc>,
+    ts_gate_published: DateTime<Utc>,
+    ts_service_received: Option<DateTime<Utc>>,
+    ts_service_sent: Option<DateTime<Utc>>,
+    ts_gate_back_received: DateTime<Utc>,
+    ts_gate_sent: DateTime<Utc>,
+) {
+    info!(
+        target: "request_timing",
+        "{}",
+        json!({
+            "signature": signature,
+            "method": method.as_str(),
+            "path": path,
+            "ts_client": ts_client,
+            "ts_gate_received": ts_gate_received,
+            "ts_gate_published": ts_gate_published,
+            "ts_service_received": ts_service_received,
+            "ts_service_sent": ts_service_sent,
+            "ts_gate_back_received": ts_gate_back_received,
+            "ts_gate_sent": ts_gate_sent,
+        })
+    );
+}
+
 fn service_error_to_http_response(srv_err: ServiceHttpError) -> HttpResponseBuilder {
     use ServiceHttpError::*;
     match srv_err {
@@ -398,6 +464,7 @@ fn service_error_to_http_response(srv_err: ServiceHttpError) -> HttpResponseBuil
         Forbidden => HttpResponse::Forbidden(),
         BadRequest => HttpResponse::BadRequest(),
         UnprocessableEntity => HttpResponse::UnprocessableEntity(),
+        InternalServerError => HttpResponse::InternalServerError(),
     }
 }
 

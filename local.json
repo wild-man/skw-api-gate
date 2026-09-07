@@ -5,7 +5,7 @@
   "service": {
     "name": "skw-api-gate",
     "bindAddress": "0.0.0.0:8443",
-    "workers": 2,
+    "workers": 10,
     "backTopicpartitionsCount": 64,
     "tls": {
       "subjectAltNames": ["localhost", "127.0.0.1", "skw-api-gate"],

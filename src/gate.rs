@@ -2,6 +2,7 @@
 use skw_lib_shared::{
     APP, AppError,
     prelude::{
+        chrono::*,
         consts::*,
         futures::StreamExt,
         iggy::*,
@@ -37,12 +38,17 @@ pub struct IggyReceivedMessage {
     pub payload: Vec<u8>,
     pub signature: Option<String>,
     pub service_error: Option<ServiceHttpError>,
+    pub ts_service_received: Option<DateTime<Utc>>,
+    pub ts_service_sent: Option<DateTime<Utc>>,
+    pub ts_gate_back_received: DateTime<Utc>,
 }
 
 impl TryFrom<ReceivedMessage> for IggyReceivedMessage {
     type Error = String;
 
     fn try_from(m: ReceivedMessage) -> Result<Self, Self::Error> {
+        let ts_gate_back_received = Utc::now();
+
         let signature_key = HeaderKey::from_str(IGGY_HEADER_SIGNATURE).map_err(|e| e.to_string())?;
 
         let signature = m
@@ -60,10 +66,31 @@ impl TryFrom<ReceivedMessage> for IggyReceivedMessage {
             .map(|s| s.to_string_value())
             .and_then(|v| v.parse::<ServiceHttpError>().ok());
 
+        let ts_service_received_key = HeaderKey::from_str(IGGY_HEADER_TS_SERVICE_RECEIVED).map_err(|e| e.to_string())?;
+        let ts_service_received = m
+            .message
+            .get_user_header(&ts_service_received_key)
+            .unwrap_or(None)
+            .map(|s| s.to_string_value())
+            .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
+            .map(|v| v.with_timezone(&Utc));
+
+        let ts_service_sent_key = HeaderKey::from_str(IGGY_HEADER_TS_SERVICE_SENT).map_err(|e| e.to_string())?;
+        let ts_service_sent = m
+            .message
+            .get_user_header(&ts_service_sent_key)
+            .unwrap_or(None)
+            .map(|s| s.to_string_value())
+            .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
+            .map(|v| v.with_timezone(&Utc));
+
         Ok(IggyReceivedMessage {
             payload: m.message.payload.to_vec(),
             signature,
             service_error,
+            ts_service_received,
+            ts_service_sent,
+            ts_gate_back_received,
         })
     }
 }
