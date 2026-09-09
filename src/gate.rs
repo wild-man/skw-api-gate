@@ -148,6 +148,8 @@ impl GateState {
         let consumer_name2 = consumer_name.clone();
         let consumer_tx = tx.clone();
         tokio::spawn(async move {
+            //@todo examine how to remove this thread
+            // if no listeners on broadcast channel then send method return an error but is not an error
             info!("starting one back receiver thread {}", consumer_name2);
 
             let mut rx = consumer_tx.subscribe();
