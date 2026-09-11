@@ -2,13 +2,14 @@ use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
     sync::{Arc, LazyLock},
-    time::Duration,
 };
 
 //@todo benchmark and compare with standard allocator
 use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+pub const CFG_PATH_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicpartitionsCount";
 
 use ntex::{
     SharedCfg,
@@ -18,7 +19,6 @@ use ntex::{
     web::{self, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer},
 };
 
-use serde_json::Value;
 use skw_lib_shared::{
     APP, AppError,
     prelude::{
@@ -28,7 +28,7 @@ use skw_lib_shared::{
         iggy::*,
         jsonrpc::{JsonRpcGateHttpRequest, ServiceHttpError},
         log::{error, info, warn},
-        serde::json,
+        serde::*,
         tools::*,
         uuid::Uuid,
     },
@@ -42,13 +42,7 @@ mod auth;
 mod gate;
 mod tls;
 
-const AUTH_SREVICE_URL: &str = "/service/authServiceUrl";
-const BACK_TOPIC_PART_COUNT: &str = "/service/backTopicpartitionsCount";
-const SERVICE_WORKERS: &str = "/service/workers";
-
 static PUBLIC_REQ_VALUE: LazyLock<Value> = LazyLock::new(|| json!({"Method": "Public", "Params": {}}));
-
-const BACK_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30); //@todo move into config
 
 #[ntex::main]
 async fn main() -> anyhow::Result<()> {
@@ -125,7 +119,7 @@ async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &IggyClient) -> 
         Ok(sd) => info!("iggy stream {} created; id:{}", stream, sd.id),
         Err(e) => warn!("failed to create iggy stream {}: {}", stream, e),
     };
-    let partitions_count = APP.config.expect_u32(BACK_TOPIC_PART_COUNT);
+    let partitions_count = APP.config.expect_u32(CFG_PATH_BACK_TOPIC_PART_COUNT);
 
     match iggy_client
         .create_topic(
@@ -223,6 +217,8 @@ async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: 
             // no headers check is needed
 
             // info!("{} {}", method, req.path());
+
+            // generate random signature
             // let mut rand_signature_bytes = [0u8; 64];
             // rand::thread_rng().fill_bytes(&mut rand_signature_bytes);
             // let rand_signature = BASE64_STANDARD.encode(rand_signature_bytes);
