@@ -30,3 +30,4 @@ rand = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
+cached = { workspace = true }

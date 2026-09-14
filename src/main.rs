@@ -4,12 +4,16 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-//@todo benchmark and compare with standard allocator
+use rand::RngCore;
+
+// give minimal improvements
 use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 pub const CFG_PATH_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicpartitionsCount";
+pub const CFG_PATH_BACK_TOPIC_BATCH_LENGTH: &str = "/service/backTopicBatchLength";
+pub const CFG_PATH_BACK_TOPIC_CONSUMERS: &str = "/service/backTopicConsumers";
 
 use ntex::{
     SharedCfg,
@@ -88,12 +92,17 @@ async fn main() -> anyhow::Result<()> {
 
     let routes_map = init_iggy(&stream, &back_topic, &iggy_client).await?;
 
+    let back_topic_batch_length = APP.config.expect_u32(CFG_PATH_BACK_TOPIC_BATCH_LENGTH);
+    let back_topic_consumers = APP.config.expect_u32(CFG_PATH_BACK_TOPIC_CONSUMERS);
+
     let gate_state = GateState::new(
         &auth_service_url,
         &stream,
         &back_topic,
         routes_map,
         iggy_client,
+        back_topic_batch_length,
+        back_topic_consumers,
     )
     .await?;
 
@@ -212,6 +221,14 @@ async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: 
         }
     };
 
+    // Subscribe before publishing: if we published first, a fast enough
+    // backend round trip could broadcast the response before we're
+    // listening for it, and since the broadcast channel has no replay
+    // buffer for late subscribers, that response would be lost and this
+    // request would time out waiting for a reply that already happened.
+
+    let rx = state.back_sender.subscribe();
+
     let (ts_client, req_signature, ts_gate_published) = match *method {
         Method::CONNECT | Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE => {
             // no headers check is needed
@@ -219,15 +236,15 @@ async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: 
             // info!("{} {}", method, req.path());
 
             // generate random signature
-            // let mut rand_signature_bytes = [0u8; 64];
-            // rand::thread_rng().fill_bytes(&mut rand_signature_bytes);
-            // let rand_signature = BASE64_STANDARD.encode(rand_signature_bytes);
+            let mut rand_signature_bytes = [0u8; 64];
+            rand::thread_rng().fill_bytes(&mut rand_signature_bytes);
+            let signature = BASE64_STANDARD.encode(rand_signature_bytes);
 
-            let next_id = state
-                .cur_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
-            let cnt_signature = BASE64_STANDARD.encode(next_id.to_be_bytes());
+            // let next_id = state
+            //     .cur_id
+            //     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            //     + 1;
+            // let signature = BASE64_STANDARD.encode(next_id.to_be_bytes());
 
             // use constant RpcMethod for all types of requests
             let Ok(public_req_body) = serde_json::to_vec(&JsonRpcGateHttpRequest {
@@ -240,14 +257,14 @@ async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: 
             match send_message_to_service(
                 producer,
                 None,
-                &cnt_signature,
+                &signature,
                 method,
                 req.path(),
                 &public_req_body,
             )
             .await
             {
-                Ok(ts_gate_published) => (None, cnt_signature.to_string(), ts_gate_published),
+                Ok(ts_gate_published) => (None, signature.to_string(), ts_gate_published),
                 Err(e) => {
                     error!("{:?}", e);
                     return e;
@@ -286,7 +303,6 @@ async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: 
         _ => return HttpResponse::BadRequest().into(),
     };
 
-    let rx = state.back_sender.subscribe();
     await_service_response(
         rx,
         &req_signature,
@@ -366,11 +382,11 @@ async fn send_message_to_service(
 async fn await_service_response(
     mut rx: Receiver<IggyReceivedMessage>,
     signature: &str,
-    method: &Method,
-    path: &str,
-    ts_client: Option<DateTime<Utc>>,
-    ts_gate_received: DateTime<Utc>,
-    ts_gate_published: DateTime<Utc>,
+    _method: &Method,
+    _path: &str,
+    _ts_client: Option<DateTime<Utc>>,
+    _ts_gate_received: DateTime<Utc>,
+    _ts_gate_published: DateTime<Utc>,
 ) -> HttpResponse {
     let wait_for_match = async move {
         loop {
@@ -389,18 +405,20 @@ async fn await_service_response(
 
     match tokio::time::timeout(BACK_MESSAGE_TIMEOUT, wait_for_match).await {
         Ok(Ok(m)) => {
-            log_request_timing(
-                signature,
-                method,
-                path,
-                ts_client,
-                ts_gate_received,
-                ts_gate_published,
-                m.ts_service_received,
-                m.ts_service_sent,
-                m.ts_gate_back_received,
-                Utc::now(),
-            );
+            /*
+                       log_request_timing(
+                           signature,
+                           method,
+                           path,
+                           ts_client,
+                           ts_gate_received,
+                           ts_gate_published,
+                           m.ts_service_received,
+                           m.ts_service_sent,
+                           m.ts_gate_back_received,
+                           Utc::now(),
+                       );
+            */
 
             match m.service_error {
                 None => HttpResponse::Ok().body(m.payload),
@@ -423,6 +441,7 @@ async fn await_service_response(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(unused)]
 fn log_request_timing(
     signature: &str,
     method: &Method,

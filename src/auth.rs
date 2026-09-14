@@ -1,3 +1,4 @@
+use cached::{TtlCache, cached};
 use ed25519_dalek::pkcs8::DecodePublicKey;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ntex::web::HttpRequest;
@@ -9,6 +10,7 @@ use skw_lib_shared::{
         uuid::Uuid,
     },
 };
+use std::time::Duration;
 
 use skw_lib_http_protos::auth::internal::*;
 
@@ -36,7 +38,9 @@ pub(crate) async fn check_auth_key_and_request_signature(url: &str, req: &HttpRe
         public_key,
         enabled,
         ..
-    } = internal_http_request(url, auth_req).await?.try_into()?;
+    } = internal_http_request_cached(url, &key, auth_req)
+        .await?
+        .try_into()?;
 
     if !enabled {
         return Err(ServiceHttpError::Forbidden.into());
@@ -55,4 +59,13 @@ pub(crate) async fn check_auth_key_and_request_signature(url: &str, req: &HttpRe
     // h_signature is base64 encoded string contains valid signature, so unwrap is safe
     let ret_signature = h_signature.unwrap().to_str().unwrap().into();
     Ok((key, ret_signature))
+}
+
+#[cached(
+    convert = r#"{ format!("{}", _key) }"#,
+    ty = "TtlCache<String, String>",
+    create = "{ TtlCache::new(Duration::from_secs(60)) }"
+)]
+async fn internal_http_request_cached(url: &str, _key: &Uuid, req: HttpMethod) -> Result<String, AppError> {
+    internal_http_request(url, req).await
 }
