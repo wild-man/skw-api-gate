@@ -6,6 +6,7 @@ use skw_lib_shared::{
     AppError,
     prelude::{
         base64::*,
+        consts::{HTTP_HEADER_API_KEY, HTTP_HEADER_PAYLOAD_SIGNATURE},
         jsonrpc::{ServiceHttpError, internal_http_request},
         uuid::Uuid,
     },
@@ -14,17 +15,15 @@ use std::time::Duration;
 
 use skw_lib_http_protos::auth::internal::*;
 
-use crate::{API_KEY_HEADER, API_PAYLOAD_SIGNATURE_HEADER};
-
 pub(crate) async fn check_auth_key_and_request_signature(url: &str, req: &HttpRequest, body: &str) -> Result<(Uuid, String), AppError> {
     let key = req
         .headers()
-        .get(API_KEY_HEADER)
+        .get(HTTP_HEADER_API_KEY)
         .and_then(|k| Uuid::try_parse_ascii(k.as_bytes()).ok())
         .filter(|u| u.get_version_num() == 7)
         .ok_or(ServiceHttpError::Forbidden)?;
 
-    let h_signature = req.headers().get(API_PAYLOAD_SIGNATURE_HEADER);
+    let h_signature = req.headers().get(HTTP_HEADER_PAYLOAD_SIGNATURE);
 
     let signature = h_signature
         .and_then(|v| BASE64_STANDARD.decode(v.as_bytes()).ok())
@@ -37,7 +36,13 @@ pub(crate) async fn check_auth_key_and_request_signature(url: &str, req: &HttpRe
         enabled,
         ..
     } = internal_http_request_cached(url, &key, auth_req)
-        .await?
+        .await
+        // unknown key is reported like any other auth failure, so clients can't probe which key ids exist;
+        // other errors (auth service down, ...) stay internal errors
+        .map_err(|e| match e {
+            AppError::Service(ServiceHttpError::NotFound) => ServiceHttpError::Forbidden.into(),
+            e => e,
+        })?
         .try_into()?;
 
     if !enabled {

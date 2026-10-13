@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use rand::RngCore;
 use serde_json::{Value, json};
 use skw_lib_shared::prelude::log::trace;
 #[allow(unused_imports)]
@@ -16,7 +15,7 @@ use skw_lib_shared::{
         strum::EnumString,
         uuid::Uuid,
     },
-    skw_get_consumer_name,
+    skw_get_consumer_name, skw_random_signature,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -259,9 +258,7 @@ async fn send_public_request(state: &GateState, producer: Arc<IggyProducer>, met
     // no headers check is needed
 
     // generate random signature
-    let mut rand_signature_bytes = [0u8; 64];
-    rand::thread_rng().fill_bytes(&mut rand_signature_bytes);
-    let signature = BASE64_STANDARD.encode(rand_signature_bytes);
+    let signature = skw_random_signature();
 
     // generate signature generation on sequence
     // let next_id = state
@@ -315,15 +312,11 @@ async fn send_open_request(
 
     // let api_key = req
     //     .headers()
-    //     .get(API_KEY_HEADER)
+    //     .get(HTTP_HEADER_API_KEY)
     //     .and_then(|k| Uuid::try_parse_ascii(k.as_bytes()).ok())
     //     .filter(|u| u.get_version_num() == 7);
 
-    let req_signature = {
-        let mut rand_signature_bytes = [0u8; 64];
-        rand::thread_rng().fill_bytes(&mut rand_signature_bytes);
-        BASE64_STANDARD.encode(rand_signature_bytes)
-    };
+    let req_signature = skw_random_signature();
 
     let rx = state.back_sender.subscribe();
     let _ts_gate_published = send_message_to_service(

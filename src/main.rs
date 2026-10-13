@@ -9,9 +9,6 @@ pub(crate) const CFG_PATH_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicparti
 pub(crate) const CFG_PATH_BACK_TOPIC_BATCH_LENGTH: &str = "/service/backTopicBatchLength";
 pub(crate) const CFG_PATH_BACK_TOPIC_CONSUMERS: &str = "/service/backTopicConsumers";
 
-pub(crate) const API_KEY_HEADER: &str = "API-KEY";
-pub(crate) const API_PAYLOAD_SIGNATURE_HEADER: &str = "PAYLOAD-SIGNATURE";
-
 use ntex::{
     SharedCfg,
     http::HttpServiceConfig,
