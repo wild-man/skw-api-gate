@@ -1,28 +1,52 @@
+use bytes::Bytes;
+use rand::RngCore;
+use serde_json::{Value, json};
+use skw_lib_shared::prelude::log::trace;
 #[allow(unused_imports)]
 use skw_lib_shared::{
     APP, AppError,
     prelude::{
+        base64::*,
         chrono::*,
         consts::*,
         futures::StreamExt,
         iggy::*,
-        jsonrpc::ServiceHttpError,
+        jsonrpc::{JsonRpcGateHttpRequest, ServiceHttpError},
         log::{error, info, warn},
         strum::EnumString,
+        uuid::Uuid,
     },
     skw_get_consumer_name,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     str::FromStr,
-    sync::{Arc, atomic::AtomicU64},
+    sync::{Arc, LazyLock, atomic::AtomicU64},
+};
+
+use tokio::sync::broadcast::Receiver;
+
+use ntex::{
+    http::Method,
+    util::Bytes as NtexBytes,
+    web::{self, HttpRequest, HttpResponse, HttpResponseBuilder},
 };
 
 use tokio::sync::broadcast::Sender;
 
+static PUBLIC_REQ_VALUE: LazyLock<Value> = LazyLock::new(|| json!({"Method": "Public", "Params": {}}));
+
 #[derive(Clone)]
 pub struct RoutesMap {
     pub map: HashMap<String, Arc<IggyProducer>>,
+}
+
+struct IggySendResult {
+    pub rx: Receiver<IggyReceivedMessage>,
+    pub _ts_client: Option<DateTime<Utc>>,
+    pub req_signature: String,
+    pub _ts_gate_received: Option<DateTime<Utc>>,
+    pub _ts_gate_published: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -187,5 +211,353 @@ impl GateState {
             _iggy_client: arc_iggy_client,
             _cur_id: Arc::new(AtomicU64::new(0)),
         })
+    }
+}
+
+pub(crate) async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: NtexBytes) -> HttpResponse {
+    let ts_gate_received = Utc::now();
+
+    let method = req.method();
+    let mut slug_split = req.path().trim_matches('/').split("/");
+    let slug1 = slug_split.next();
+    let slug2 = slug_split.next();
+
+    let topic_key = match (slug1, slug2) {
+        (None, _) => return HttpResponse::BadRequest().into(),
+        (Some(s1), None) => s1,
+        (Some(s1), Some(s2)) => &format!("{s1}/{s2}"),
+    };
+
+    let producer = match state.routes_map.map.get(topic_key) {
+        None => return HttpResponse::BadRequest().into(),
+        Some(p) => p.clone(),
+    };
+
+    let send_result = match *method {
+        Method::CONNECT | Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE => match slug2.unwrap_or_default().try_into() {
+            Ok(TopicType::Public) => send_public_request(&state, producer, method, req.path()).await,
+            _ => return HttpResponse::BadRequest().into(),
+        },
+        Method::PATCH | Method::POST | Method::PUT | Method::DELETE | Method::QUERY => match slug2.unwrap_or_default().try_into() {
+            Ok(TopicType::Open) => send_open_request(&state, producer, &req, method, &body).await,
+            Ok(TopicType::Signed) => send_signed_request(&state, producer, &req, method, &body).await,
+            _ => return HttpResponse::BadRequest().into(),
+        },
+        _ => return HttpResponse::BadRequest().into(),
+    };
+
+    let mut sr = match send_result {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
+    sr._ts_gate_received = Some(ts_gate_received);
+    await_service_response(sr, method, req.path()).await
+}
+
+async fn send_public_request(state: &GateState, producer: Arc<IggyProducer>, method: &Method, path: &str) -> Result<IggySendResult, HttpResponse> {
+    // no headers check is needed
+
+    // generate random signature
+    let mut rand_signature_bytes = [0u8; 64];
+    rand::thread_rng().fill_bytes(&mut rand_signature_bytes);
+    let signature = BASE64_STANDARD.encode(rand_signature_bytes);
+
+    // generate signature generation on sequence
+    // let next_id = state
+    //     .cur_id
+    //     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    //     + 1;
+    // let signature = BASE64_STANDARD.encode(next_id.to_be_bytes());
+
+    // use constant RpcMethod for all types of requests
+    let Ok(public_req_body) = serde_json::to_vec(&JsonRpcGateHttpRequest {
+        ts: Utc::now(),
+        method: PUBLIC_REQ_VALUE.clone(),
+    }) else {
+        return Err(HttpResponse::Gone().into());
+    };
+
+    let rx = state.back_sender.subscribe(); // prevent late subscription error!
+    match send_message_to_service(producer, None, &signature, method, path, &public_req_body).await {
+        Ok(_ts_gate_published) => Ok(IggySendResult {
+            rx,
+            _ts_client: None,
+            req_signature: signature,
+            _ts_gate_published,
+            _ts_gate_received: None,
+        }),
+        Err(e) => {
+            error!("{:?}", e);
+            Err(e)
+        }
+    }
+}
+
+async fn send_open_request(
+    state: &GateState,
+    producer: Arc<IggyProducer>,
+    req: &HttpRequest,
+    method: &Method,
+    body: &[u8],
+) -> Result<IggySendResult, HttpResponse> {
+    let Ok(str_body) = std::str::from_utf8(body) else {
+        return Err(HttpResponse::BadRequest().into());
+    };
+
+    let _ts_client = match serde_json::from_str::<JsonRpcGateHttpRequest>(str_body) {
+        Ok(r) => Some(r.ts),
+        // valid JSON that doesn't match the struct (e.g. missing `Ts`) - allowed for open requests
+        Err(e) if e.is_data() => None,
+        // syntax error / truncated input - not JSON at all
+        Err(_) => return Err(HttpResponse::BadRequest().into()),
+    };
+
+    // let api_key = req
+    //     .headers()
+    //     .get(API_KEY_HEADER)
+    //     .and_then(|k| Uuid::try_parse_ascii(k.as_bytes()).ok())
+    //     .filter(|u| u.get_version_num() == 7);
+
+    let req_signature = {
+        let mut rand_signature_bytes = [0u8; 64];
+        rand::thread_rng().fill_bytes(&mut rand_signature_bytes);
+        BASE64_STANDARD.encode(rand_signature_bytes)
+    };
+
+    let rx = state.back_sender.subscribe();
+    let _ts_gate_published = send_message_to_service(
+        producer,
+        // api_key.as_ref(),
+        None,
+        &req_signature,
+        method,
+        req.path(),
+        body,
+    )
+    .await?;
+
+    Ok(IggySendResult {
+        rx,
+        _ts_client,
+        req_signature,
+        _ts_gate_published,
+        _ts_gate_received: None,
+    })
+}
+
+async fn send_signed_request(
+    state: &GateState,
+    producer: Arc<IggyProducer>,
+    req: &HttpRequest,
+    method: &Method,
+    body: &[u8],
+) -> Result<IggySendResult, HttpResponse> {
+    let Ok(str_body) = std::str::from_utf8(body) else {
+        return Err(HttpResponse::BadRequest().into());
+    };
+
+    let ts_client = match serde_json::from_str::<JsonRpcGateHttpRequest>(str_body) {
+        Ok(r) => r.ts,
+        Err(_) => return Err(HttpResponse::BadRequest().into()),
+    };
+
+    let (api_key, req_signature) = match crate::auth::check_auth_key_and_request_signature(&state.auth_service_url, req, str_body).await {
+        Ok(s) => s,
+        Err(e) => return Err(app_error_to_http_response(req, e)),
+    };
+
+    let rx = state.back_sender.subscribe();
+    let _ts_gate_published = send_message_to_service(
+        producer,
+        Some(&api_key),
+        &req_signature,
+        method,
+        req.path(),
+        body,
+    )
+    .await?;
+
+    Ok(IggySendResult {
+        rx,
+        _ts_client: Some(ts_client),
+        req_signature,
+        _ts_gate_published,
+        _ts_gate_received: None,
+    })
+}
+
+async fn send_message_to_service(
+    producer: Arc<IggyProducer>,
+    api_key: Option<&Uuid>,
+    signature: &str,
+    method: &Method,
+    path: &str,
+    body: &[u8],
+) -> Result<DateTime<Utc>, HttpResponse> {
+    let mut headers = BTreeMap::new();
+
+    headers.insert(
+        HeaderKey::from_str(IGGY_HEADER_SIGNATURE).unwrap(),
+        HeaderValue::from_str(signature).map_err(|e| {
+            error!("iggy header error IGGY_HEADER_SIGNATURE {}", e);
+            HttpResponse::InternalServerError()
+        })?,
+    );
+
+    if let Some(key) = api_key {
+        headers.insert(
+            HeaderKey::from_str(IGGY_HEADER_API_KEY).unwrap(),
+            HeaderValue::from_str(&key.to_string()).map_err(|e| {
+                error!("iggy header error IGGY_HEADER_API_KEY {}", e);
+                HttpResponse::InternalServerError()
+            })?,
+        );
+    }
+
+    headers.insert(
+        HeaderKey::from_str(IGGY_HEADER_HTTP_METHOD).unwrap(),
+        HeaderValue::from_str(method.as_str()).map_err(|e| {
+            error!("iggy header error IGGY_HEADER_HTTP_METHOD {}", e);
+            HttpResponse::InternalServerError()
+        })?,
+    );
+
+    headers.insert(
+        HeaderKey::from_str(IGGY_HEADER_HTTP_PATH).unwrap(),
+        HeaderValue::from_str(path).map_err(|e| {
+            error!("iggy header error IGGY_HEADER_HTTP_PATH {}", e);
+            HttpResponse::InternalServerError()
+        })?,
+    );
+
+    let bytes = Bytes::copy_from_slice(body); //@todo try to remove copy_from_slice
+    let message = IggyMessage::builder()
+        .payload(bytes)
+        .user_headers(headers)
+        .build();
+
+    if let Err(e) = message {
+        error!("Iggy build message error: {}", e);
+        return Err(HttpResponse::InternalServerError().into());
+    }
+
+    if let Err(e) = producer.send_one(message.unwrap()).await {
+        error!("sending to iggy error: {}", e);
+        return Err(HttpResponse::InternalServerError().into());
+    }
+
+    Ok(Utc::now())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn await_service_response(mut sr: IggySendResult, _method: &Method, _path: &str) -> HttpResponse {
+    let signature = sr.req_signature.clone();
+    let wait_for_match = async move {
+        loop {
+            match sr.rx.recv().await {
+                Ok(m) if m.signature.is_some() => {
+                    if *m.signature.as_ref().unwrap_or(&"".to_string()) == *sr.req_signature {
+                        return Ok(m);
+                    }
+                    continue;
+                }
+                Ok(_) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    };
+
+    match tokio::time::timeout(BACK_MESSAGE_TIMEOUT, wait_for_match).await {
+        Ok(Ok(m)) => {
+            /*
+                       log_request_timing(
+                           signature,
+                           method,
+                           path,
+                           ts_client,
+                           ts_gate_received,
+                           ts_gate_published,
+                           m.ts_service_received,
+                           m.ts_service_sent,
+                           m.ts_gate_back_received,
+                           Utc::now(),
+                       );
+            */
+
+            match m.service_error {
+                None => HttpResponse::Ok().body(m.payload),
+                // add body from service response to transfer original service response to user
+                Some(s) => service_error_to_http_response(s).body(m.payload),
+            }
+        }
+        Ok(Err(e)) => {
+            error!("back channel error: {}", e);
+            HttpResponse::InternalServerError().into()
+        }
+        Err(_) => {
+            warn!(
+                "timeout waiting for backend response signature: {}",
+                signature
+            );
+            HttpResponse::GatewayTimeout().into()
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(unused)]
+fn log_request_timing(
+    signature: &str,
+    method: &Method,
+    path: &str,
+    ts_client: Option<DateTime<Utc>>,
+    ts_gate_received: DateTime<Utc>,
+    ts_gate_published: DateTime<Utc>,
+    ts_service_received: Option<DateTime<Utc>>,
+    ts_service_sent: Option<DateTime<Utc>>,
+    ts_gate_back_received: DateTime<Utc>,
+    ts_gate_sent: DateTime<Utc>,
+) {
+    trace!(
+        target: "request_timing",
+        "{}",
+        json!({
+            "signature": signature,
+            "method": method.as_str(),
+            "path": path,
+            "ts_client": ts_client,
+            "ts_gate_received": ts_gate_received,
+            "ts_gate_published": ts_gate_published,
+            "ts_service_received": ts_service_received,
+            "ts_service_sent": ts_service_sent,
+            "ts_gate_back_received": ts_gate_back_received,
+            "ts_gate_sent": ts_gate_sent,
+        })
+    );
+}
+
+fn service_error_to_http_response(srv_err: ServiceHttpError) -> HttpResponseBuilder {
+    use ServiceHttpError::*;
+    match srv_err {
+        NotFound => HttpResponse::NotFound(),
+        Forbidden => HttpResponse::Forbidden(),
+        BadRequest => HttpResponse::BadRequest(),
+        UnprocessableEntity => HttpResponse::UnprocessableEntity(),
+        InternalServerError => HttpResponse::InternalServerError(),
+    }
+}
+
+fn internal_error(_req: &HttpRequest, e: String) -> HttpResponse {
+    error!("internal error: {}", e);
+    HttpResponse::InternalServerError().into()
+}
+
+fn app_error_to_http_response(req: &HttpRequest, app_error: AppError) -> HttpResponse {
+    use AppError::*;
+    match app_error {
+        Service(s) => service_error_to_http_response(s).into(),
+        Custom(e) => internal_error(req, e),
+        e => internal_error(req, e.to_string()),
     }
 }

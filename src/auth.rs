@@ -14,8 +14,7 @@ use std::time::Duration;
 
 use skw_lib_http_protos::auth::internal::*;
 
-const API_KEY_HEADER: &str = "API-KEY";
-const API_PAYLOAD_SIGNATURE_HEADER: &str = "PAYLOAD-SIGNATURE";
+use crate::{API_KEY_HEADER, API_PAYLOAD_SIGNATURE_HEADER};
 
 pub(crate) async fn check_auth_key_and_request_signature(url: &str, req: &HttpRequest, body: &str) -> Result<(Uuid, String), AppError> {
     let key = req
@@ -32,7 +31,6 @@ pub(crate) async fn check_auth_key_and_request_signature(url: &str, req: &HttpRe
         .and_then(|v| Signature::from_slice(&v).ok())
         .ok_or(ServiceHttpError::Forbidden)?;
 
-    //@todo cache this answer
     let auth_req = HttpMethod::GetKeyById { id: key };
     let HttpPayload::GetKeyById {
         public_key,

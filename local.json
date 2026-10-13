@@ -6,9 +6,9 @@
     "name": "skw-api-gate",
     "bindAddress": "0.0.0.0:8443",
     "workers": 10,
-    "backTopicpartitionsCount": 16,
+    "backTopicpartitionsCount": 2,
     "backTopicBatchLength": 1000,
-    "backTopicConsumers": 16,
+    "backTopicConsumers": 2,
     "tls": {
       "subjectAltNames": ["localhost", "127.0.0.1", "skw-api-gate"],
       "certPath": "../../conf/skw-api-gate.cert.pem",
@@ -23,9 +23,14 @@
   },
   "topicsMap": {
     "ping":{
-      "customName": "",
       "partitionsCount": 3,
-      "messageExpiry": 31
+      "messageExpiry": 31,
+      "topicTypes": ["public", "open", "signed"]
+    },
+    "auth":{
+      "partitionsCount": 1,
+      "messageExpiry": 31,
+      "topicTypes": ["public", "open", "signed"]
     }
   }
 }

@@ -14,7 +14,7 @@
       "certPath": "./skw-api-gate.cert.pem",
       "keyPath": "./skw-api-gate.key.pem"
     },
-    "authServiceUrl": "http://skw-auth-service",
+    "authServiceUrl": "http://skw-auth-http-service",
     "rootKey": "01a01500-98d5-71fc-9038-71acb78d61c4"
   },
   "iggy": {
@@ -23,9 +23,14 @@
   },
   "topicsMap": {
     "ping":{
-      "customName": "",
       "partitionsCount": 10,
-      "messageExpiry": 31
+      "messageExpiry": 31,
+      "topic_types": ["public", "open", "signed"]
+    },
+    "auth":{
+      "partitionsCount": 1,
+      "messageExpiry": 31,
+      "topic_types": ["public", "open", "signed"]
     }
   }
 }

@@ -1,52 +1,39 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    str::FromStr,
-    sync::{Arc, LazyLock},
-};
-
-use rand::RngCore;
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 // give minimal improvements
 use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-pub const CFG_PATH_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicpartitionsCount";
-pub const CFG_PATH_BACK_TOPIC_BATCH_LENGTH: &str = "/service/backTopicBatchLength";
-pub const CFG_PATH_BACK_TOPIC_CONSUMERS: &str = "/service/backTopicConsumers";
+pub(crate) const CFG_PATH_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicpartitionsCount";
+pub(crate) const CFG_PATH_BACK_TOPIC_BATCH_LENGTH: &str = "/service/backTopicBatchLength";
+pub(crate) const CFG_PATH_BACK_TOPIC_CONSUMERS: &str = "/service/backTopicConsumers";
+
+pub(crate) const API_KEY_HEADER: &str = "API-KEY";
+pub(crate) const API_PAYLOAD_SIGNATURE_HEADER: &str = "PAYLOAD-SIGNATURE";
 
 use ntex::{
     SharedCfg,
-    http::{HttpServiceConfig, Method},
+    http::HttpServiceConfig,
     time::Seconds,
-    util::Bytes as NtexBytes,
-    web::{self, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer},
+    web::{self, App, HttpServer},
 };
 
 use skw_lib_shared::{
     APP, AppError,
     prelude::{
-        base64::*,
-        chrono::*,
         consts::*,
         iggy::*,
-        jsonrpc::{JsonRpcGateHttpRequest, ServiceHttpError},
-        log::{error, info, warn},
-        serde::*,
+        log::{info, warn},
         tools::*,
-        uuid::Uuid,
     },
 };
 
-use tokio::sync::broadcast::Receiver;
-
-use crate::gate::{GateState, IggyReceivedMessage, RoutesMap};
+use crate::gate::{GateState, RoutesMap};
 
 mod auth;
 mod gate;
 mod tls;
-
-static PUBLIC_REQ_VALUE: LazyLock<Value> = LazyLock::new(|| json!({"Method": "Public", "Params": {}}));
 
 #[ntex::main]
 async fn main() -> anyhow::Result<()> {
@@ -92,8 +79,8 @@ async fn main() -> anyhow::Result<()> {
 
     let routes_map = init_iggy(&stream, &back_topic, &iggy_client).await?;
 
-    let back_topic_batch_length = APP.config.expect_u32(CFG_PATH_BACK_TOPIC_BATCH_LENGTH);
-    let back_topic_consumers = APP.config.expect_u32(CFG_PATH_BACK_TOPIC_CONSUMERS);
+    let bt_batch_length = APP.config.expect_u32(CFG_PATH_BACK_TOPIC_BATCH_LENGTH);
+    let bt_consumers = APP.config.expect_u32(CFG_PATH_BACK_TOPIC_CONSUMERS);
 
     let gate_state = GateState::new(
         &auth_service_url,
@@ -101,8 +88,8 @@ async fn main() -> anyhow::Result<()> {
         &back_topic,
         routes_map,
         iggy_client,
-        back_topic_batch_length,
-        back_topic_consumers,
+        bt_batch_length,
+        bt_consumers,
     )
     .await?;
 
@@ -110,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
     HttpServer::new(async move || {
         App::new()
             .state(gate_state.clone())
-            .default_service(web::route().to(catch_all))
+            .default_service(web::route().to(gate::catch_all))
     })
     .bind_rustls(&bind_addr, &tls_config)?
     .config(shared_http_cfg)
@@ -155,47 +142,24 @@ async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &IggyClient) -> 
             for (service, topic_cfg) in t.as_object().expect("invalid topic configuration").iter() {
                 // dbg!((service_name, topic_cfg));
                 let cfg: TopicConfig = topic_cfg.try_into()?;
+                for topic_type in &cfg.topic_types {
+                    let topic = format!("{}-{}-{}", service, topic_type, VERSION);
+                    let topic_key = format!("{service}/{topic_type}");
 
-                let topic = cfg
-                    .custom_name
-                    .unwrap_or(format!("{}-{}", service, VERSION));
+                    skw_is_valid_name(&topic).unwrap_or_else(|| panic!("invalid topic name: {}", topic));
 
-                skw_is_valid_name(&topic).unwrap_or_else(|| panic!("invalid topic name: {}", topic));
-
-                match iggy_client
-                    .create_topic(
+                    create_iggy_topic(
+                        iggy_client,
+                        &mut routes_map,
+                        &cfg,
+                        service,
                         &stream_id,
+                        stream,
+                        &topic_key,
                         &topic,
-                        cfg.partitions_count,
-                        cfg.compression_algorithm,
-                        None,
-                        cfg.message_expiry,
-                        cfg.max_topic_size,
                     )
-                    .await
-                {
-                    Ok(t) => info!("created topic: {} (id:{}); stream: {}", topic, t.id, stream),
-                    Err(e) => warn!(
-                        "error create topic: {}; stream: {}; error: {}",
-                        topic, stream, e
-                    ),
+                    .await;
                 }
-
-                info!(
-                    "creating producer for service: {}; stream: {}; topic: {};",
-                    service, stream, topic
-                );
-
-                let producer = iggy_client
-                    .producer(stream, &topic)
-                    .expect("producer create error") // stream: "orders", topic: "events"
-                    .partitioning(Partitioning::balanced()) // Automatically balances across partitions
-                    .build();
-
-                routes_map
-                    .map
-                    .entry(service.clone())
-                    .or_insert(Arc::new(producer));
             }
         }
         None => warn!("no topics configurations found in config"),
@@ -204,295 +168,49 @@ async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &IggyClient) -> 
     Ok(routes_map)
 }
 
-async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: NtexBytes) -> HttpResponse {
-    let ts_gate_received = Utc::now();
-
-    let method = req.method();
-    let slug1 = req.path().split("/").nth(1);
-
-    let producer = match slug1 {
-        None => return HttpResponse::BadRequest().into(),
-        Some(s) => {
-            let p = state.routes_map.map.get(s);
-            match p {
-                None => return HttpResponse::BadRequest().into(),
-                Some(pp) => pp.clone(),
-            }
-        }
-    };
-
-    // Subscribe before publishing: if we published first, a fast enough
-    // backend round trip could broadcast the response before we're
-    // listening for it, and since the broadcast channel has no replay
-    // buffer for late subscribers, that response would be lost and this
-    // request would time out waiting for a reply that already happened.
-
-    let rx = state.back_sender.subscribe();
-
-    let (ts_client, req_signature, ts_gate_published) = match *method {
-        Method::CONNECT | Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE => {
-            // no headers check is needed
-
-            // info!("{} {}", method, req.path());
-
-            // generate random signature
-            let mut rand_signature_bytes = [0u8; 64];
-            rand::thread_rng().fill_bytes(&mut rand_signature_bytes);
-            let signature = BASE64_STANDARD.encode(rand_signature_bytes);
-
-            // let next_id = state
-            //     .cur_id
-            //     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            //     + 1;
-            // let signature = BASE64_STANDARD.encode(next_id.to_be_bytes());
-
-            // use constant RpcMethod for all types of requests
-            let Ok(public_req_body) = serde_json::to_vec(&JsonRpcGateHttpRequest {
-                ts: Utc::now(),
-                method: PUBLIC_REQ_VALUE.clone(),
-            }) else {
-                return HttpResponse::Gone().into();
-            };
-
-            match send_message_to_service(
-                producer,
-                None,
-                &signature,
-                method,
-                req.path(),
-                &public_req_body,
-            )
-            .await
-            {
-                Ok(ts_gate_published) => (None, signature.to_string(), ts_gate_published),
-                Err(e) => {
-                    error!("{:?}", e);
-                    return e;
-                }
-            }
-        }
-        Method::PATCH | Method::POST | Method::PUT | Method::DELETE | Method::QUERY => {
-            let Ok(str_body) = std::str::from_utf8(&body) else {
-                return HttpResponse::BadRequest().into();
-            };
-
-            let ts_client = match serde_json::from_str::<JsonRpcGateHttpRequest>(str_body) {
-                Err(_) => return HttpResponse::BadRequest().into(),
-                Ok(r) => r.ts,
-            };
-
-            let (api_key, req_signature) = match auth::check_auth_key_and_request_signature(&state.auth_service_url, &req, str_body).await {
-                Err(e) => return app_error_to_http_response(&req, e),
-                Ok(s) => s,
-            };
-
-            match send_message_to_service(
-                producer,
-                Some(&api_key),
-                &req_signature,
-                method,
-                req.path(),
-                &body,
-            )
-            .await
-            {
-                Ok(ts_gate_published) => (Some(ts_client), req_signature, ts_gate_published),
-                Err(e) => return e,
-            }
-        }
-        _ => return HttpResponse::BadRequest().into(),
-    };
-
-    await_service_response(
-        rx,
-        &req_signature,
-        method,
-        req.path(),
-        ts_client,
-        ts_gate_received,
-        ts_gate_published,
-    )
-    .await
-}
-
-async fn send_message_to_service(
-    producer: Arc<IggyProducer>,
-    api_key: Option<&Uuid>,
-    signature: &str,
-    method: &Method,
-    path: &str,
-    body: &[u8],
-) -> Result<DateTime<Utc>, HttpResponse> {
-    let mut headers = BTreeMap::new();
-
-    headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_SIGNATURE).unwrap(),
-        HeaderValue::from_str(signature).map_err(|e| {
-            error!("iggy header error IGGY_HEADER_SIGNATURE {}", e);
-            HttpResponse::InternalServerError()
-        })?,
-    );
-
-    if let Some(key) = api_key {
-        headers.insert(
-            HeaderKey::from_str(IGGY_HEADER_API_KEY).unwrap(),
-            HeaderValue::from_str(&key.to_string()).map_err(|e| {
-                error!("iggy header error IGGY_HEADER_API_KEY {}", e);
-                HttpResponse::InternalServerError()
-            })?,
-        );
+#[allow(clippy::too_many_arguments)]
+async fn create_iggy_topic(
+    iggy_client: &IggyClient,
+    routes_map: &mut RoutesMap,
+    cfg: &TopicConfig,
+    service: &str,
+    stream_id: &Identifier,
+    stream: &str,
+    topic_key: &str,
+    topic: &str,
+) {
+    match iggy_client
+        .create_topic(
+            stream_id,
+            topic,
+            cfg.partitions_count,
+            cfg.compression_algorithm,
+            None,
+            cfg.message_expiry,
+            cfg.max_topic_size,
+        )
+        .await
+    {
+        Ok(t) => info!("created topic: {} (id:{}); stream: {}", topic, t.id, stream),
+        Err(e) => warn!(
+            "error create topic: {}; stream: {}; error: {}",
+            topic, stream, e
+        ),
     }
 
-    headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_HTTP_METHOD).unwrap(),
-        HeaderValue::from_str(method.as_str()).map_err(|e| {
-            error!("iggy header error IGGY_HEADER_HTTP_METHOD {}", e);
-            HttpResponse::InternalServerError()
-        })?,
+    info!(
+        "creating producer for service: {}; stream: {}; topic: {};",
+        service, stream, topic
     );
 
-    headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_HTTP_PATH).unwrap(),
-        HeaderValue::from_str(path).map_err(|e| {
-            error!("iggy header error IGGY_HEADER_HTTP_PATH {}", e);
-            HttpResponse::InternalServerError()
-        })?,
-    );
-
-    let bytes = Bytes::copy_from_slice(body); //@todo try to remove copy_from_slice
-    let message = IggyMessage::builder()
-        .payload(bytes)
-        .user_headers(headers)
+    let producer = iggy_client
+        .producer(stream, topic)
+        .expect("producer create error") // stream: "orders", topic: "events"
+        .partitioning(Partitioning::balanced()) // Automatically balances across partitions
         .build();
 
-    if let Err(e) = message {
-        error!("Iggy build message error: {}", e);
-        return Err(HttpResponse::InternalServerError().into());
-    }
-
-    if let Err(e) = producer.send_one(message.unwrap()).await {
-        error!("sending to iggy error: {}", e);
-        return Err(HttpResponse::InternalServerError().into());
-    }
-
-    Ok(Utc::now())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn await_service_response(
-    mut rx: Receiver<IggyReceivedMessage>,
-    signature: &str,
-    _method: &Method,
-    _path: &str,
-    _ts_client: Option<DateTime<Utc>>,
-    _ts_gate_received: DateTime<Utc>,
-    _ts_gate_published: DateTime<Utc>,
-) -> HttpResponse {
-    let wait_for_match = async move {
-        loop {
-            match rx.recv().await {
-                Ok(m) if m.signature.is_some() => {
-                    if m.signature.as_ref().unwrap() == signature {
-                        return Ok(m);
-                    }
-                    continue;
-                }
-                Ok(_) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-    };
-
-    match tokio::time::timeout(BACK_MESSAGE_TIMEOUT, wait_for_match).await {
-        Ok(Ok(m)) => {
-            /*
-                       log_request_timing(
-                           signature,
-                           method,
-                           path,
-                           ts_client,
-                           ts_gate_received,
-                           ts_gate_published,
-                           m.ts_service_received,
-                           m.ts_service_sent,
-                           m.ts_gate_back_received,
-                           Utc::now(),
-                       );
-            */
-
-            match m.service_error {
-                None => HttpResponse::Ok().body(m.payload),
-                // add body from service response to transfer original service response to user
-                Some(s) => service_error_to_http_response(s).body(m.payload),
-            }
-        }
-        Ok(Err(e)) => {
-            error!("back channel error: {}", e);
-            HttpResponse::InternalServerError().into()
-        }
-        Err(_) => {
-            warn!(
-                "timeout waiting for backend response signature: {}",
-                signature
-            );
-            HttpResponse::GatewayTimeout().into()
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(unused)]
-fn log_request_timing(
-    signature: &str,
-    method: &Method,
-    path: &str,
-    ts_client: Option<DateTime<Utc>>,
-    ts_gate_received: DateTime<Utc>,
-    ts_gate_published: DateTime<Utc>,
-    ts_service_received: Option<DateTime<Utc>>,
-    ts_service_sent: Option<DateTime<Utc>>,
-    ts_gate_back_received: DateTime<Utc>,
-    ts_gate_sent: DateTime<Utc>,
-) {
-    info!(
-        target: "request_timing",
-        "{}",
-        json!({
-            "signature": signature,
-            "method": method.as_str(),
-            "path": path,
-            "ts_client": ts_client,
-            "ts_gate_received": ts_gate_received,
-            "ts_gate_published": ts_gate_published,
-            "ts_service_received": ts_service_received,
-            "ts_service_sent": ts_service_sent,
-            "ts_gate_back_received": ts_gate_back_received,
-            "ts_gate_sent": ts_gate_sent,
-        })
-    );
-}
-
-fn service_error_to_http_response(srv_err: ServiceHttpError) -> HttpResponseBuilder {
-    use ServiceHttpError::*;
-    match srv_err {
-        NotFound => HttpResponse::NotFound(),
-        Forbidden => HttpResponse::Forbidden(),
-        BadRequest => HttpResponse::BadRequest(),
-        UnprocessableEntity => HttpResponse::UnprocessableEntity(),
-        InternalServerError => HttpResponse::InternalServerError(),
-    }
-}
-
-fn internal_error(_req: &HttpRequest, e: String) -> HttpResponse {
-    error!("internal error: {}", e);
-    HttpResponse::InternalServerError().into()
-}
-
-fn app_error_to_http_response(req: &HttpRequest, app_error: AppError) -> HttpResponse {
-    use AppError::*;
-    match app_error {
-        Service(s) => service_error_to_http_response(s).into(),
-        Custom(e) => internal_error(req, e),
-        e => internal_error(req, e.to_string()),
-    }
+    routes_map
+        .map
+        .entry(topic_key.to_string())
+        .or_insert(Arc::new(producer));
 }
