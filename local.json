@@ -6,7 +6,7 @@
     "name": "skw-api-gate",
     "bindAddress": "0.0.0.0:8443",
     "workers": 10,
-    "backTopicpartitionsCount": 2,
+    "backTopicpartitionsCount": 7,
     "backTopicBatchLength": 1000,
     "backTopicConsumers": 2,
     "tls": {
@@ -15,7 +15,10 @@
       "keyPath": "../../conf/skw-api-gate.key.pem"
     },
     "authServiceUrl": "http://localhost:9001",
-    "rootKey": "01a01500-98d5-71fc-9038-71acb78d61c4"
+    "rootKey": "01a01500-98d5-71fc-9038-71acb78d61c4",
+    "cors": {
+      "allowedOrigins": ["https://127.0.0.1:8000", "https://localhost:8000"]
+    }
   },
   "iggy": {
     "url": "iggy://iggy:Secret123!@localhost:8081",
@@ -31,6 +34,11 @@
       "partitionsCount": 1,
       "messageExpiry": 31,
       "topicTypes": ["public", "open", "signed"]
+    },
+    "dialog":{
+      "partitionsCount": 3,
+      "messageExpiry": 31,
+      "topicTypes": ["signed"]
     }
   }
 }

@@ -7,7 +7,7 @@ use skw_lib_shared::{
     prelude::{
         base64::*,
         consts::{HTTP_HEADER_API_KEY, HTTP_HEADER_PAYLOAD_SIGNATURE},
-        jsonrpc::{ServiceHttpError, internal_http_request},
+        jsonrpc::{SkwServiceHttpError, internal_http_request},
         uuid::Uuid,
     },
 };
@@ -21,14 +21,14 @@ pub(crate) async fn check_auth_key_and_request_signature(url: &str, req: &HttpRe
         .get(HTTP_HEADER_API_KEY)
         .and_then(|k| Uuid::try_parse_ascii(k.as_bytes()).ok())
         .filter(|u| u.get_version_num() == 7)
-        .ok_or(ServiceHttpError::Forbidden)?;
+        .ok_or(SkwServiceHttpError::Forbidden)?;
 
     let h_signature = req.headers().get(HTTP_HEADER_PAYLOAD_SIGNATURE);
 
     let signature = h_signature
         .and_then(|v| BASE64_STANDARD.decode(v.as_bytes()).ok())
         .and_then(|v| Signature::from_slice(&v).ok())
-        .ok_or(ServiceHttpError::Forbidden)?;
+        .ok_or(SkwServiceHttpError::Forbidden)?;
 
     let auth_req = HttpMethod::GetKeyById { id: key };
     let HttpPayload::GetKeyById {
@@ -40,24 +40,24 @@ pub(crate) async fn check_auth_key_and_request_signature(url: &str, req: &HttpRe
         // unknown key is reported like any other auth failure, so clients can't probe which key ids exist;
         // other errors (auth service down, ...) stay internal errors
         .map_err(|e| match e {
-            AppError::Service(ServiceHttpError::NotFound) => ServiceHttpError::Forbidden.into(),
+            AppError::Service(SkwServiceHttpError::NotFound) => SkwServiceHttpError::Forbidden.into(),
             e => e,
         })?
         .try_into()?;
 
     if !enabled {
-        return Err(ServiceHttpError::Forbidden.into());
+        return Err(SkwServiceHttpError::Forbidden.into());
     }
 
     let public_key_der = BASE64_STANDARD
         .decode(public_key)
-        .map_err(|_| ServiceHttpError::Forbidden)?;
+        .map_err(|_| SkwServiceHttpError::Forbidden)?;
 
-    let verifying_key = VerifyingKey::from_public_key_der(&public_key_der).map_err(|_| ServiceHttpError::Forbidden)?;
+    let verifying_key = VerifyingKey::from_public_key_der(&public_key_der).map_err(|_| SkwServiceHttpError::Forbidden)?;
 
     verifying_key
         .verify(body.as_bytes(), &signature)
-        .map_err(|_| ServiceHttpError::Forbidden)?;
+        .map_err(|_| SkwServiceHttpError::Forbidden)?;
 
     // h_signature is base64 encoded string contains valid signature, so unwrap is safe
     let ret_signature = h_signature.unwrap().to_str().unwrap().into();

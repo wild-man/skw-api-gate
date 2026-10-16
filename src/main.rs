@@ -29,11 +29,12 @@ use skw_lib_shared::{
 use crate::gate::{GateState, RoutesMap};
 
 mod auth;
+mod cors;
 mod gate;
 mod tls;
 
 #[ntex::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), AppError> {
     let bind_addr = APP.config.expect_string(SERVICE_BIND_ADDRESS);
     let back_topic = skw_get_back_topic_name();
     let stream = skw_get_stream_name();
@@ -60,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .expect("unable to install rustls aws-lc-rs CryptoProvider");
 
-    let tls_config = tls::build_rustls_config()?;
+    let tls_config = tls::build_rustls_config();
+    cors::init();
 
     //@todo move values into config
     let http_cfg = HttpServiceConfig::new()
@@ -96,11 +98,13 @@ async fn main() -> anyhow::Result<()> {
             .state(gate_state.clone())
             .default_service(web::route().to(gate::catch_all))
     })
-    .bind_rustls(&bind_addr, &tls_config)?
+    .bind_rustls(&bind_addr, &tls_config)
+    .map_err(|e| AppError::Custom(e.to_string()))?
     .config(shared_http_cfg)
     .workers(workers)
     .run()
-    .await?;
+    .await
+    .map_err(|e| AppError::Custom(e.to_string()))?;
 
     Ok(())
 }

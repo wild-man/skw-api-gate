@@ -1,6 +1,4 @@
 use bytes::Bytes;
-use serde_json::{Value, json};
-use skw_lib_shared::prelude::log::trace;
 #[allow(unused_imports)]
 use skw_lib_shared::{
     APP, AppError,
@@ -10,8 +8,9 @@ use skw_lib_shared::{
         consts::*,
         futures::StreamExt,
         iggy::*,
-        jsonrpc::{JsonRpcGateHttpRequest, ServiceHttpError},
-        log::{error, info, warn},
+        jsonrpc::{JsonRpcGateHttpRequest, SkwServiceHttpError},
+        log::{debug, error, info, trace, warn},
+        serde::*,
         strum::EnumString,
         uuid::Uuid,
     },
@@ -23,7 +22,7 @@ use std::{
     sync::{Arc, LazyLock, atomic::AtomicU64},
 };
 
-use tokio::sync::broadcast::Receiver;
+use tokio::sync::broadcast::{Receiver, Sender};
 
 use ntex::{
     http::Method,
@@ -31,7 +30,7 @@ use ntex::{
     web::{self, HttpRequest, HttpResponse, HttpResponseBuilder},
 };
 
-use tokio::sync::broadcast::Sender;
+use crate::cors;
 
 static PUBLIC_REQ_VALUE: LazyLock<Value> = LazyLock::new(|| json!({"Method": "Public", "Params": {}}));
 
@@ -60,19 +59,19 @@ pub struct GateState {
 pub struct IggyReceivedMessage {
     pub payload: Vec<u8>,
     pub signature: Option<String>,
-    pub service_error: Option<ServiceHttpError>,
+    pub service_error: Option<SkwServiceHttpError>,
     pub _ts_service_received: Option<DateTime<Utc>>,
     pub _ts_service_sent: Option<DateTime<Utc>>,
     pub _ts_gate_back_received: DateTime<Utc>,
 }
 
 impl TryFrom<ReceivedMessage> for IggyReceivedMessage {
-    type Error = String;
+    type Error = AppError;
 
     fn try_from(m: ReceivedMessage) -> Result<Self, Self::Error> {
         let ts_gate_back_received = Utc::now();
 
-        let signature_key = HeaderKey::from_str(IGGY_HEADER_SIGNATURE).map_err(|e| e.to_string())?;
+        let signature_key = HeaderKey::from_str(IGGY_HEADER_SIGNATURE)?;
 
         let signature = m
             .message
@@ -80,16 +79,16 @@ impl TryFrom<ReceivedMessage> for IggyReceivedMessage {
             .unwrap_or(None)
             .map(|s| s.to_string_value());
 
-        let service_error_key = HeaderKey::from_str(IGGY_HEADER_SERVICE_ERROR).map_err(|e| e.to_string())?;
+        let service_error_key = HeaderKey::from_str(IGGY_HEADER_SERVICE_ERROR)?;
 
         let service_error = m
             .message
             .get_user_header(&service_error_key)
             .unwrap_or(None)
             .map(|s| s.to_string_value())
-            .and_then(|v| v.parse::<ServiceHttpError>().ok());
+            .and_then(|v| v.parse::<SkwServiceHttpError>().ok());
 
-        let ts_service_received_key = HeaderKey::from_str(IGGY_HEADER_TS_SERVICE_RECEIVED).map_err(|e| e.to_string())?;
+        let ts_service_received_key = HeaderKey::from_str(IGGY_HEADER_TS_SERVICE_RECEIVED)?;
         let ts_service_received = m
             .message
             .get_user_header(&ts_service_received_key)
@@ -98,7 +97,7 @@ impl TryFrom<ReceivedMessage> for IggyReceivedMessage {
             .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
             .map(|v| v.with_timezone(&Utc));
 
-        let ts_service_sent_key = HeaderKey::from_str(IGGY_HEADER_TS_SERVICE_SENT).map_err(|e| e.to_string())?;
+        let ts_service_sent_key = HeaderKey::from_str(IGGY_HEADER_TS_SERVICE_SENT)?;
         let ts_service_sent = m
             .message
             .get_user_header(&ts_service_sent_key)
@@ -128,7 +127,19 @@ impl GateState {
         back_topic_batch_length: u32,
         back_topic_consumers: u32,
     ) -> Result<Self, AppError> {
-        // let consumer_name = format!("consumer-{}", back_topic);
+        // Back-topic consumer group "consumer-{back_topic}". gates/ws reads the same
+        // back topic under its own group ("consumer-ws-{back_topic}"); different
+        // groups each get the full message stream, so neither gate can steal the
+        // other's replies — each just drops messages nobody here is waiting for.
+        // Keep the two names distinct.
+        //
+        // Caveat: every api-gate *process* uses this same group name, so running
+        // several api-gate replicas puts them in one group and Iggy splits back
+        // partitions between them — a reply for a request waiting on replica A can
+        // land on replica B, get dropped there, and A times out. Before scaling
+        // horizontally, make the group per-instance or route replies to a
+        // partition owned by the requesting instance. (The N workers below are
+        // fine: they're one process and all feed the same broadcast channel.)
         let consumer_name = skw_get_consumer_name(back_topic);
 
         let (ts, _) = tokio::sync::broadcast::channel::<IggyReceivedMessage>(1000);
@@ -190,8 +201,10 @@ impl GateState {
                         match message {
                             Ok(received) => match received.try_into() {
                                 Ok(m) => {
-                                    if let Err(e) = consumer_ts.send(m) {
-                                        error!("tokio::sync::broadcast::channel error: {}", e)
+                                    // Err only means "no receivers right now" (no request in flight, a reply meant
+                                    // for the ws gate, or a late reply after timeout). Not a failure.
+                                    if consumer_ts.send(m).is_err() {
+                                        debug!("back message dropped: no request waiting for it");
                                     }
                                 }
                                 Err(e) => error!("error converting back message: {}", e),
@@ -214,6 +227,19 @@ impl GateState {
 }
 
 pub(crate) async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: NtexBytes) -> HttpResponse {
+    let cors_origin = cors::allowed_origin(&req);
+    if cors::is_preflight(&req) {
+        return cors::preflight_response(cors_origin);
+    }
+
+    let mut resp = handle_request(state, req, body).await;
+    if let Some(origin) = cors_origin {
+        cors::add_headers(&mut resp, origin);
+    }
+    resp
+}
+
+async fn handle_request(state: web::types::State<GateState>, req: HttpRequest, body: NtexBytes) -> HttpResponse {
     let ts_gate_received = Utc::now();
 
     let method = req.method();
@@ -234,12 +260,12 @@ pub(crate) async fn catch_all(state: web::types::State<GateState>, req: HttpRequ
 
     let send_result = match *method {
         Method::CONNECT | Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE => match slug2.unwrap_or_default().try_into() {
-            Ok(TopicType::Public) => send_public_request(&state, producer, method, req.path()).await,
+            Ok(SkwTopicType::Public) => send_public_request(&state, producer, method, req.path()).await,
             _ => return HttpResponse::BadRequest().into(),
         },
         Method::PATCH | Method::POST | Method::PUT | Method::DELETE | Method::QUERY => match slug2.unwrap_or_default().try_into() {
-            Ok(TopicType::Open) => send_open_request(&state, producer, &req, method, &body).await,
-            Ok(TopicType::Signed) => send_signed_request(&state, producer, &req, method, &body).await,
+            Ok(SkwTopicType::Open) => send_open_request(&state, producer, &req, method, &body).await,
+            Ok(SkwTopicType::Signed) => send_signed_request(&state, producer, &req, method, &body).await,
             _ => return HttpResponse::BadRequest().into(),
         },
         _ => return HttpResponse::BadRequest().into(),
@@ -530,8 +556,8 @@ fn log_request_timing(
     );
 }
 
-fn service_error_to_http_response(srv_err: ServiceHttpError) -> HttpResponseBuilder {
-    use ServiceHttpError::*;
+fn service_error_to_http_response(srv_err: SkwServiceHttpError) -> HttpResponseBuilder {
+    use SkwServiceHttpError::*;
     match srv_err {
         NotFound => HttpResponse::NotFound(),
         Forbidden => HttpResponse::Forbidden(),
