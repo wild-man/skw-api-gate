@@ -6,7 +6,7 @@
     "name": "skw-api-gate",
     "bindAddress": "0.0.0.0:443",
     "workers": 2,
-    "backTopicpartitionsCount": 7,
+    "backTopicPartitionsCount": 7,
     "backTopicBatchLength": 1000,
     "backTopicConsumers": 4,
     "tls": {

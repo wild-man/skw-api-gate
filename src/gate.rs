@@ -8,7 +8,7 @@ use skw_lib_shared::{
         consts::*,
         futures::StreamExt,
         iggy::*,
-        jsonrpc::{JsonRpcGateHttpRequest, SkwServiceHttpError},
+        jsonrpc::{JsonRpcGateHttpRequest, SkwServiceHttpError, SkwServiceStatus},
         log::{debug, error, info, trace, warn},
         serde::*,
         strum::EnumString,
@@ -60,6 +60,8 @@ pub struct IggyReceivedMessage {
     pub payload: Vec<u8>,
     pub signature: Option<String>,
     pub service_error: Option<SkwServiceHttpError>,
+    /// Some = provisional reply (Created/Accepted); the final one for this signature follows
+    pub service_status: Option<SkwServiceStatus>,
     pub _ts_service_received: Option<DateTime<Utc>>,
     pub _ts_service_sent: Option<DateTime<Utc>>,
     pub _ts_gate_back_received: DateTime<Utc>,
@@ -88,6 +90,14 @@ impl TryFrom<ReceivedMessage> for IggyReceivedMessage {
             .map(|s| s.to_string_value())
             .and_then(|v| v.parse::<SkwServiceHttpError>().ok());
 
+        let service_status_key = HeaderKey::from_str(IGGY_HEADER_SERVICE_STATUS)?;
+        let service_status = m
+            .message
+            .get_user_header(&service_status_key)
+            .unwrap_or(None)
+            .map(|s| s.to_string_value())
+            .and_then(|v| v.parse::<SkwServiceStatus>().ok());
+
         let ts_service_received_key = HeaderKey::from_str(IGGY_HEADER_TS_SERVICE_RECEIVED)?;
         let ts_service_received = m
             .message
@@ -110,6 +120,7 @@ impl TryFrom<ReceivedMessage> for IggyReceivedMessage {
             payload: m.message.payload.to_vec(),
             signature,
             service_error,
+            service_status,
             _ts_service_received: ts_service_received,
             _ts_service_sent: ts_service_sent,
             _ts_gate_back_received: ts_gate_back_received,
@@ -504,10 +515,14 @@ async fn await_service_response(mut sr: IggySendResult, _method: &Method, _path:
                        );
             */
 
-            match m.service_error {
-                None => HttpResponse::Ok().body(m.payload),
+            match (m.service_error, m.service_status) {
                 // add body from service response to transfer original service response to user
-                Some(s) => service_error_to_http_response(s).body(m.payload),
+                (Some(s), _) => service_error_to_http_response(s).body(m.payload),
+                // provisional reply: HTTP answers only once, so it ends the request and the
+                // final reply for this signature is skipped (client reads the result later)
+                (None, Some(SkwServiceStatus::Created)) => HttpResponse::Created().body(m.payload),
+                (None, Some(SkwServiceStatus::Accepted)) => HttpResponse::Accepted().body(m.payload),
+                (None, None) => HttpResponse::Ok().body(m.payload),
             }
         }
         Ok(Err(e)) => {

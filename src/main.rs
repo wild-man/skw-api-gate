@@ -5,7 +5,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-pub(crate) const CFG_PATH_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicpartitionsCount";
+pub(crate) const CFG_PATH_BACK_TOPIC_PART_COUNT: &str = "/service/backTopicPartitionsCount";
 pub(crate) const CFG_PATH_BACK_TOPIC_BATCH_LENGTH: &str = "/service/backTopicBatchLength";
 pub(crate) const CFG_PATH_BACK_TOPIC_CONSUMERS: &str = "/service/backTopicConsumers";
 
