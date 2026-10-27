@@ -73,8 +73,7 @@ async fn main() -> Result<(), AppError> {
 
     let shared_http_cfg = SharedCfg::new("api-gate").add(http_cfg);
 
-    let iggy = APP.iggy.clone().connect().await;
-    let iggy_client = iggy.inner().expect("bad iggy client");
+    let iggy_client = APP.iggy.clone().connect().await?.inner();
 
     let routes_map = init_iggy(&stream, &back_topic, &iggy_client).await?;
 
@@ -142,7 +141,10 @@ async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &IggyClient) -> 
         Some(t) => {
             for (service, topic_cfg) in t.as_object().expect("invalid topic configuration").iter() {
                 // dbg!((service_name, topic_cfg));
-                let cfg: TopicConfig = topic_cfg.try_into()?;
+                let cfg: TopicConfig = topic_cfg
+                    .try_into()
+                    .map_err(|e| format!("{GATE_TOPICS_MAP}/{service}: {e}"))?;
+
                 for topic_type in &cfg.topic_types {
                     let topic = format!("{}-{}-{}", service, topic_type, VERSION);
                     let topic_key = format!("{service}/{topic_type}");

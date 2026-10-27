@@ -1,9 +1,7 @@
 use bytes::Bytes;
-#[allow(unused_imports)]
 use skw_lib_shared::{
     APP, AppError,
     prelude::{
-        base64::*,
         chrono::*,
         consts::*,
         futures::StreamExt,
@@ -11,10 +9,9 @@ use skw_lib_shared::{
         jsonrpc::{JsonRpcGateHttpRequest, SkwServiceHttpError, SkwServiceStatus},
         log::{debug, error, info, trace, warn},
         serde::*,
-        strum::EnumString,
         uuid::Uuid,
     },
-    skw_get_consumer_name, skw_random_signature,
+    skw_get_consumer_name, skw_is_outdated, skw_random_signature,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -22,7 +19,7 @@ use std::{
     sync::{Arc, LazyLock, atomic::AtomicU64},
 };
 
-use tokio::sync::broadcast::{Receiver, Sender};
+use tokio::sync::broadcast::{Receiver, Sender, error::RecvError};
 
 use ntex::{
     http::Method,
@@ -31,6 +28,9 @@ use ntex::{
 };
 
 use crate::cors;
+
+/// pause between attempts to rebuild a back-topic consumer after its stream ended
+const BACK_CONSUMER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 static PUBLIC_REQ_VALUE: LazyLock<Value> = LazyLock::new(|| json!({"Method": "Public", "Params": {}}));
 
@@ -60,7 +60,8 @@ pub struct IggyReceivedMessage {
     pub payload: Vec<u8>,
     pub signature: Option<String>,
     pub service_error: Option<SkwServiceHttpError>,
-    /// Some = provisional reply (Created/Accepted); the final one for this signature follows
+    /// Some = provisional reply (Created/Accepted): it ends the HTTP request; the final reply that
+    /// follows under the same signature finds nobody waiting and is dropped
     pub service_status: Option<SkwServiceStatus>,
     pub _ts_service_received: Option<DateTime<Utc>>,
     pub _ts_service_sent: Option<DateTime<Utc>>,
@@ -73,57 +74,23 @@ impl TryFrom<ReceivedMessage> for IggyReceivedMessage {
     fn try_from(m: ReceivedMessage) -> Result<Self, Self::Error> {
         let ts_gate_back_received = Utc::now();
 
-        let signature_key = HeaderKey::from_str(IGGY_HEADER_SIGNATURE)?;
-
-        let signature = m
-            .message
-            .get_user_header(&signature_key)
-            .unwrap_or(None)
-            .map(|s| s.to_string_value());
-
-        let service_error_key = HeaderKey::from_str(IGGY_HEADER_SERVICE_ERROR)?;
-
-        let service_error = m
-            .message
-            .get_user_header(&service_error_key)
-            .unwrap_or(None)
-            .map(|s| s.to_string_value())
-            .and_then(|v| v.parse::<SkwServiceHttpError>().ok());
-
-        let service_status_key = HeaderKey::from_str(IGGY_HEADER_SERVICE_STATUS)?;
-        let service_status = m
-            .message
-            .get_user_header(&service_status_key)
-            .unwrap_or(None)
-            .map(|s| s.to_string_value())
-            .and_then(|v| v.parse::<SkwServiceStatus>().ok());
-
-        let ts_service_received_key = HeaderKey::from_str(IGGY_HEADER_TS_SERVICE_RECEIVED)?;
-        let ts_service_received = m
-            .message
-            .get_user_header(&ts_service_received_key)
-            .unwrap_or(None)
-            .map(|s| s.to_string_value())
-            .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
-            .map(|v| v.with_timezone(&Utc));
-
-        let ts_service_sent_key = HeaderKey::from_str(IGGY_HEADER_TS_SERVICE_SENT)?;
-        let ts_service_sent = m
-            .message
-            .get_user_header(&ts_service_sent_key)
-            .unwrap_or(None)
-            .map(|s| s.to_string_value())
-            .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
-            .map(|v| v.with_timezone(&Utc));
+        // decoded once: every `get_user_header` call would decode the whole map again
+        let headers = m.message.user_headers_map()?;
+        let header = |key: &HeaderKey| header_str(headers.as_ref(), key);
+        let ts_header = |key: &HeaderKey| {
+            header(key)
+                .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
+                .map(|v| v.with_timezone(&Utc))
+        };
 
         Ok(IggyReceivedMessage {
-            payload: m.message.payload.to_vec(),
-            signature,
-            service_error,
-            service_status,
-            _ts_service_received: ts_service_received,
-            _ts_service_sent: ts_service_sent,
+            signature: header(&header_keys::SIGNATURE),
+            service_error: header(&header_keys::SERVICE_ERROR).and_then(|v| v.parse().ok()),
+            service_status: header(&header_keys::SERVICE_STATUS).and_then(|v| v.parse().ok()),
+            _ts_service_received: ts_header(&header_keys::TS_SERVICE_RECEIVED),
+            _ts_service_sent: ts_header(&header_keys::TS_SERVICE_SENT),
             _ts_gate_back_received: ts_gate_back_received,
+            payload: m.message.payload.to_vec(),
         })
     }
 }
@@ -138,11 +105,11 @@ impl GateState {
         back_topic_batch_length: u32,
         back_topic_consumers: u32,
     ) -> Result<Self, AppError> {
-        // Back-topic consumer group "consumer-{back_topic}". gates/ws reads the same
-        // back topic under its own group ("consumer-ws-{back_topic}"); different
-        // groups each get the full message stream, so neither gate can steal the
-        // other's replies — each just drops messages nobody here is waiting for.
-        // Keep the two names distinct.
+        // Back-topic consumer group "consumer-{service name}-{back_topic}" (skw_get_consumer_name,
+        // service name from /service/name, "skw-api-gate"). gates/ws reads the same back topic
+        // under its own service name, so the groups differ: each group gets the full message
+        // stream, neither gate can steal the other's replies, and each just drops messages nobody
+        // here is waiting for. Keep the two gates' /service/name values distinct.
         //
         // Caveat: every api-gate *process* uses this same group name, so running
         // several api-gate replicas puts them in one group and Iggy splits back
@@ -167,43 +134,20 @@ impl GateState {
             let consumer_name = consumer_name.clone();
             let consumer_ts = ts.clone();
 
+            // own connection per worker (see above); fail fast at startup,
+            // later failures are retried by the receiver loop below
+            let client = APP.iggy.clone().connect().await?.inner();
+            let mut iggy_consumer = build_back_consumer(
+                &client,
+                &consumer_name,
+                &stream,
+                &back_topic,
+                back_topic_batch_length,
+            )
+            .await?;
+
             tokio::spawn(async move {
                 loop {
-                    let iggy = APP.iggy.clone().connect().await;
-                    let Some(client) = iggy.inner() else {
-                        error!("back receiver #{worker_id}: no iggy client available");
-                        return;
-                    };
-
-                    let mut iggy_consumer = match client.consumer_group(&consumer_name, &stream, &back_topic) {
-                        Ok(builder) => {
-                            let poll_interval = match IggyDuration::from_str("1ms") {
-                                Ok(i) => i,
-                                Err(e) => {
-                                    error!("back receiver #{worker_id}: invalid poll interval: {e}");
-                                    return;
-                                }
-                            };
-                            builder
-                                .auto_commit(AutoCommit::When(AutoCommitWhen::ConsumingEachMessage))
-                                .create_consumer_group_if_not_exists()
-                                .auto_join_consumer_group()
-                                .polling_strategy(PollingStrategy::next())
-                                .poll_interval(poll_interval)
-                                .batch_length(back_topic_batch_length)
-                                .build()
-                        }
-                        Err(e) => {
-                            error!("back receiver #{worker_id}: failed to build consumer: {e}");
-                            return;
-                        }
-                    };
-
-                    if let Err(e) = iggy_consumer.init().await {
-                        error!("back receiver #{worker_id}: failed to init consumer: {e}");
-                        return;
-                    }
-
                     info!(
                         "starting back receiver thread #{worker_id} {}",
                         consumer_name
@@ -223,6 +167,30 @@ impl GateState {
                             Err(e) => error!("Error while receiving message: {}", e),
                         }
                     }
+
+                    // an ended stream stays ended: rebuild the consumer (with a pause between attempts)
+                    warn!(
+                        "back receiver #{worker_id} stream ended, rebuilding consumer {}",
+                        consumer_name
+                    );
+                    iggy_consumer = loop {
+                        tokio::time::sleep(BACK_CONSUMER_RETRY_DELAY).await;
+                        match build_back_consumer(
+                            &client,
+                            &consumer_name,
+                            &stream,
+                            &back_topic,
+                            back_topic_batch_length,
+                        )
+                        .await
+                        {
+                            Ok(c) => break c,
+                            Err(e) => error!(
+                                "back receiver #{worker_id}: rebuilding consumer {} failed: {}",
+                                consumer_name, e
+                            ),
+                        }
+                    };
                 }
             });
         }
@@ -235,6 +203,28 @@ impl GateState {
             _cur_id: Arc::new(AtomicU64::new(0)),
         })
     }
+}
+
+/// Joins (creating if needed) the back-topic consumer group and initializes the consumer.
+async fn build_back_consumer(
+    client: &IggyClient,
+    consumer_name: &str,
+    stream: &str,
+    back_topic: &str,
+    batch_length: u32,
+) -> Result<IggyConsumer, AppError> {
+    let mut consumer = client
+        .consumer_group(consumer_name, stream, back_topic)?
+        .auto_commit(AutoCommit::When(AutoCommitWhen::ConsumingEachMessage))
+        .create_consumer_group_if_not_exists()
+        .auto_join_consumer_group()
+        .polling_strategy(PollingStrategy::next())
+        .poll_interval(IggyDuration::from_str("1ms").map_err(|e| AppError::Custom(e.to_string()))?)
+        .batch_length(batch_length)
+        .build();
+
+    consumer.init().await?;
+    Ok(consumer)
 }
 
 pub(crate) async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: NtexBytes) -> HttpResponse {
@@ -309,7 +299,7 @@ async fn send_public_request(state: &GateState, producer: Arc<IggyProducer>, met
         ts: Utc::now(),
         method: PUBLIC_REQ_VALUE.clone(),
     }) else {
-        return Err(HttpResponse::Gone().into());
+        return Err(HttpResponse::InternalServerError().into());
     };
 
     let rx = state.back_sender.subscribe(); // prevent late subscription error!
@@ -397,6 +387,15 @@ async fn send_signed_request(
         Err(e) => return Err(app_error_to_http_response(req, e)),
     };
 
+    // valid signature over an old (possibly replayed) or future-dated body
+    if skw_is_outdated(ts_client) {
+        warn!(
+            "outdated signed request, Ts: {}; signature: {}",
+            ts_client, req_signature
+        );
+        return Err(HttpResponse::Conflict().into());
+    }
+
     let rx = state.back_sender.subscribe();
     let _ts_gate_published = send_message_to_service(
         producer,
@@ -428,7 +427,7 @@ async fn send_message_to_service(
     let mut headers = BTreeMap::new();
 
     headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_SIGNATURE).unwrap(),
+        header_keys::SIGNATURE.clone(),
         HeaderValue::from_str(signature).map_err(|e| {
             error!("iggy header error IGGY_HEADER_SIGNATURE {}", e);
             HttpResponse::InternalServerError()
@@ -437,7 +436,7 @@ async fn send_message_to_service(
 
     if let Some(key) = api_key {
         headers.insert(
-            HeaderKey::from_str(IGGY_HEADER_API_KEY).unwrap(),
+            header_keys::API_KEY.clone(),
             HeaderValue::from_str(&key.to_string()).map_err(|e| {
                 error!("iggy header error IGGY_HEADER_API_KEY {}", e);
                 HttpResponse::InternalServerError()
@@ -446,7 +445,7 @@ async fn send_message_to_service(
     }
 
     headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_HTTP_METHOD).unwrap(),
+        header_keys::HTTP_METHOD.clone(),
         HeaderValue::from_str(method.as_str()).map_err(|e| {
             error!("iggy header error IGGY_HEADER_HTTP_METHOD {}", e);
             HttpResponse::InternalServerError()
@@ -454,7 +453,7 @@ async fn send_message_to_service(
     );
 
     headers.insert(
-        HeaderKey::from_str(IGGY_HEADER_HTTP_PATH).unwrap(),
+        header_keys::HTTP_PATH.clone(),
         HeaderValue::from_str(path).map_err(|e| {
             error!("iggy header error IGGY_HEADER_HTTP_PATH {}", e);
             HttpResponse::InternalServerError()
@@ -462,17 +461,19 @@ async fn send_message_to_service(
     );
 
     let bytes = Bytes::copy_from_slice(body); //@todo try to remove copy_from_slice
-    let message = IggyMessage::builder()
+    let message = match IggyMessage::builder()
         .payload(bytes)
         .user_headers(headers)
-        .build();
+        .build()
+    {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Iggy build message error: {}", e);
+            return Err(HttpResponse::InternalServerError().into());
+        }
+    };
 
-    if let Err(e) = message {
-        error!("Iggy build message error: {}", e);
-        return Err(HttpResponse::InternalServerError().into());
-    }
-
-    if let Err(e) = producer.send_one(message.unwrap()).await {
+    if let Err(e) = producer.send_one(message).await {
         error!("sending to iggy error: {}", e);
         return Err(HttpResponse::InternalServerError().into());
     }
@@ -480,19 +481,22 @@ async fn send_message_to_service(
     Ok(Utc::now())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn await_service_response(mut sr: IggySendResult, _method: &Method, _path: &str) -> HttpResponse {
     let signature = sr.req_signature.clone();
     let wait_for_match = async move {
         loop {
             match sr.rx.recv().await {
-                Ok(m) if m.signature.is_some() => {
-                    if *m.signature.as_ref().unwrap_or(&"".to_string()) == *sr.req_signature {
-                        return Ok(m);
-                    }
+                Ok(m) if m.signature.as_deref() == Some(sr.req_signature.as_str()) => return Ok(m),
+                Ok(_) => continue,
+                // fell behind the shared channel: the skipped messages may have held this
+                // reply, but it may still come, so keep waiting until the timeout
+                Err(RecvError::Lagged(skipped)) => {
+                    warn!(
+                        "back receiver lagged, {skipped} messages skipped; signature: {}",
+                        sr.req_signature
+                    );
                     continue;
                 }
-                Ok(_) => continue,
                 Err(e) => return Err(e),
             }
         }
@@ -539,8 +543,14 @@ async fn await_service_response(mut sr: IggySendResult, _method: &Method, _path:
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(unused)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per timing point of a request"
+)]
+#[expect(
+    dead_code,
+    reason = "timing log, its call in await_service_response is commented out"
+)]
 fn log_request_timing(
     signature: &str,
     method: &Method,

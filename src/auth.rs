@@ -1,4 +1,4 @@
-use cached::{TtlCache, cached};
+use cached::{LruTtlCache, cached};
 use ed25519_dalek::pkcs8::DecodePublicKey;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ntex::web::HttpRequest;
@@ -14,6 +14,10 @@ use skw_lib_shared::{
 use std::time::Duration;
 
 use skw_lib_http_protos::auth::internal::*;
+
+/// max cached keys: random key ids (each a cache miss) must not grow the cache without bound
+const KEY_CACHE_MAX_SIZE: usize = 10_000;
+const KEY_CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub(crate) async fn check_auth_key_and_request_signature(url: &str, req: &HttpRequest, body: &str) -> Result<(Uuid, String), AppError> {
     let key = req
@@ -64,10 +68,12 @@ pub(crate) async fn check_auth_key_and_request_signature(url: &str, req: &HttpRe
     Ok((key, ret_signature))
 }
 
+// cached 4.x keeps only `Ok` results, so an auth-service failure is retried on the next request;
+// the LRU bound evicts the least recently used key once KEY_CACHE_MAX_SIZE is reached
 #[cached(
     convert = r#"{ format!("{}", _key) }"#,
-    ty = "TtlCache<String, String>",
-    create = "{ TtlCache::new(Duration::from_secs(60)) }"
+    ty = "LruTtlCache<String, String>",
+    create = "{ LruTtlCache::new(KEY_CACHE_MAX_SIZE, KEY_CACHE_TTL) }"
 )]
 async fn internal_http_request_cached(url: &str, _key: &Uuid, req: HttpMethod) -> Result<String, AppError> {
     internal_http_request(url, req).await
