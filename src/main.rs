@@ -13,7 +13,7 @@ use ntex::{
     SharedCfg,
     http::HttpServiceConfig,
     time::Seconds,
-    web::{self, App, HttpServer},
+    web::{self, App},
 };
 
 use skw_lib_shared::{
@@ -92,14 +92,13 @@ async fn main() -> Result<(), AppError> {
     .await?;
 
     info!("starting skw-api-gate listening on https://{}", bind_addr);
-    HttpServer::new(async move || {
-        App::new()
-            .state(gate_state.clone())
-            .default_service(web::route().to(gate::catch_all))
-    })
-    .bind_rustls(&bind_addr, &tls_config)
+    // one shared gate state for all workers, handed to each worker's app
+    web::server_with_config(
+        async move || Ok::<_, std::io::Error>(gate_state.clone()),
+        async |_| App::<GateState>::new().default_service(web::route().to_with_state(gate::catch_all)),
+    )
+    .bind_rustls(&bind_addr, &tls_config, shared_http_cfg)
     .map_err(|e| AppError::Custom(e.to_string()))?
-    .config(shared_http_cfg)
     .workers(workers)
     .run()
     .await
@@ -121,11 +120,15 @@ async fn init_iggy(stream: &str, back_topic: &str, iggy_client: &IggyClient) -> 
         .create_topic(
             &stream_id,
             back_topic,
-            partitions_count,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ExpireDuration(IggyDuration::from_str("60s").unwrap()),
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(partitions_count),
+                compression_algorithm: Some(CompressionAlgorithm::None),
+                message_expiry: Some(IggyExpiry::ExpireDuration(
+                    IggyDuration::from_str("60s").unwrap(),
+                )),
+                max_topic_size: Some(MaxTopicSize::ServerDefault),
+                ..Default::default()
+            },
         )
         .await
     {
@@ -183,15 +186,7 @@ async fn create_iggy_topic(
     topic: &str,
 ) {
     match iggy_client
-        .create_topic(
-            stream_id,
-            topic,
-            cfg.partitions_count,
-            cfg.compression_algorithm,
-            None,
-            cfg.message_expiry,
-            cfg.max_topic_size,
-        )
+        .create_topic(stream_id, topic, &cfg.create_options())
         .await
     {
         Ok(t) => info!("created topic: {} (id:{}); stream: {}", topic, t.id, stream),

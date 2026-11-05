@@ -227,7 +227,12 @@ async fn build_back_consumer(
     Ok(consumer)
 }
 
-pub(crate) async fn catch_all(state: web::types::State<GateState>, req: HttpRequest, body: NtexBytes) -> HttpResponse {
+/// the api gate's web application state: shared by every worker (`web::server_with_config`)
+impl web::State for GateState {
+    type Error = web::DefaultError;
+}
+
+pub(crate) async fn catch_all(state: &GateState, _: (), req: HttpRequest, body: NtexBytes) -> HttpResponse {
     let cors_origin = cors::allowed_origin(&req);
     if cors::is_preflight(&req) {
         return cors::preflight_response(cors_origin);
@@ -240,7 +245,7 @@ pub(crate) async fn catch_all(state: web::types::State<GateState>, req: HttpRequ
     resp
 }
 
-async fn handle_request(state: web::types::State<GateState>, req: HttpRequest, body: NtexBytes) -> HttpResponse {
+async fn handle_request(state: &GateState, req: HttpRequest, body: NtexBytes) -> HttpResponse {
     let ts_gate_received = Utc::now();
 
     let method = req.method();
@@ -261,12 +266,12 @@ async fn handle_request(state: web::types::State<GateState>, req: HttpRequest, b
 
     let send_result = match *method {
         Method::CONNECT | Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE => match slug2.unwrap_or_default().try_into() {
-            Ok(SkwTopicType::Public) => send_public_request(&state, producer, method, req.path()).await,
+            Ok(SkwTopicType::Public) => send_public_request(state, producer, method, req.path()).await,
             _ => return HttpResponse::BadRequest().into(),
         },
         Method::PATCH | Method::POST | Method::PUT | Method::DELETE | Method::QUERY => match slug2.unwrap_or_default().try_into() {
-            Ok(SkwTopicType::Open) => send_open_request(&state, producer, &req, method, &body).await,
-            Ok(SkwTopicType::Signed) => send_signed_request(&state, producer, &req, method, &body).await,
+            Ok(SkwTopicType::Open) => send_open_request(state, producer, &req, method, &body).await,
+            Ok(SkwTopicType::Signed) => send_signed_request(state, producer, &req, method, &body).await,
             _ => return HttpResponse::BadRequest().into(),
         },
         _ => return HttpResponse::BadRequest().into(),
